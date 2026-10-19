@@ -153,3 +153,91 @@ class BidirectionalAdapter(nn.Module):
     def count_parameters(self) -> int:
         """统计可训练参数数量"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class CrossAttentionResampler(nn.Module):
+    """
+    变长 / 跨网格重采样器（Stage 1a）
+
+    解决的问题：当目标模型与源模型的 token 网格不一致时（不同 tokenizer、不同
+    层数、乃至跨模态），P_in 的「逐位置线性映射」不成立（输出长度必须等于输入长度）。
+    这里改用交叉注意力：
+
+        query  = 目标模型自己的 token 表示 [B, T_q, D_q]（决定输出网格与位置语义）
+        kv     = 源模型/专家的隐状态       [B, T_kv, D_kv]（提供被读取的内容）
+        output = [B, T_q, D_q]
+
+    这样输出长度由 query 侧决定，与源侧长度 T_kv 解耦；且由于 query 侧自带位置
+    语义，替换/叠加到目标模型的第 k 层输入时不会破坏其位置结构。
+
+    默认对 o_proj 做零初始化：初始时本模块输出恒为 0，所以「叠加」用法下模型
+    行为完全退化为目标模型原生行为，可安全接入（无预热崩溃）。该性质也是跨模态
+    （Stage 2/3）能复用同一算子的前提。
+    """
+    
+    def __init__(self, query_dim: int, kv_dim: int, attn_dim: Optional[int] = None,
+                 num_heads: int = 8, dropout: float = 0.0, zero_init: bool = True):
+        super().__init__()
+        attn_dim = attn_dim or query_dim
+        if attn_dim % num_heads != 0:
+            raise ValueError(
+                f"attn_dim({attn_dim}) 必须能被 num_heads({num_heads}) 整除"
+            )
+        self.attn_dim = attn_dim
+        self.num_heads = num_heads
+        self.head_dim = attn_dim // num_heads
+        
+        self.q_proj = nn.Linear(query_dim, attn_dim)
+        self.k_proj = nn.Linear(kv_dim, attn_dim)
+        self.v_proj = nn.Linear(kv_dim, attn_dim)
+        self.o_proj = nn.Linear(attn_dim, query_dim)
+        self.drop = nn.Dropout(dropout)
+        
+        if zero_init:
+            nn.init.zeros_(self.o_proj.weight)
+            nn.init.zeros_(self.o_proj.bias)
+    
+    def forward(self, query: torch.Tensor, kv: torch.Tensor,
+                kv_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            query: 目标侧表示 [B, T_q, D_q]
+            kv: 源侧隐状态 [B, T_kv, D_kv]
+            kv_mask: 源侧有效位掩码 [B, T_kv]，1=有效；None 表示全有效
+        
+        Returns:
+            [B, T_q, D_q]
+        """
+        batch, t_q, _ = query.shape
+        t_kv = kv.shape[1]
+        dtype = query.dtype
+        
+        q = self.q_proj(query).view(batch, t_q, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(kv).view(batch, t_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(kv).view(batch, t_kv, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        attn_mask = None
+        empty_rows = None
+        if kv_mask is not None:
+            keep = kv_mask.to(torch.bool)
+            # 整行无有效源时 SDPA 会得到 NaN，这里用第 0 位占位，事后把输出清零
+            empty_rows = ~keep.any(dim=1)
+            if empty_rows.any():
+                keep = keep.clone()
+                keep[empty_rows, 0] = True
+            keep = keep[:, None, None, :]  # [B, 1, 1, T_kv]
+            attn_mask = torch.zeros(keep.shape, dtype=dtype, device=query.device)
+            attn_mask = attn_mask.masked_fill(~keep, float("-inf"))
+        
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.drop.p if self.training else 0.0,
+        )
+        out = out.transpose(1, 2).reshape(batch, t_q, self.attn_dim)
+        out = self.o_proj(out)
+        
+        if empty_rows is not None and empty_rows.any():
+            out = out.clone()
+            out[empty_rows] = 0.0
+        return out

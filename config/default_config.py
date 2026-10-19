@@ -48,6 +48,12 @@ class AdapterConfig:
     # 初始化方式：xavier / identity / zero
     init_method: str = "identity"
 
+    # 变长/跨网格重采样（Stage 1a）：none（默认，要求大小模型同 tokenizer，直接替换输入）
+    # / cross_attn（目标侧用自己的 token 网格做 query，去读源侧隐状态，允许长度不同）
+    resampler_type: str = "none"
+    # 重采样器注意力头数
+    resampler_heads: int = 8
+
 
 @dataclass
 class GatingConfig:

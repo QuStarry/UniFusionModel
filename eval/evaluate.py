@@ -419,6 +419,9 @@ def run_evaluation(config: UniFusionConfig, adapter_path: Optional[str] = None,
     print("\n[3/3] 构建UniFusion模型...")
     model = UniFusionModel(config)
     model.set_models(large_model, small_model, large_tokenizer, small_tokenizer)
+    # 评测必须走 eval 模式：否则适配层/门控/重采样器的 dropout 会在推理时持续生效，
+    # 导致结果随机抖动（nn.Module 默认 training=True）。
+    model.eval()
     
     # 加载适配层
     if adapter_path and os.path.exists(adapter_path):

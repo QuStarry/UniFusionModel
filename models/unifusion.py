@@ -21,7 +21,7 @@ from typing import Optional, Dict, Tuple, List, Any
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-from .adapter import BidirectionalAdapter
+from .adapter import BidirectionalAdapter, CrossAttentionResampler
 from .gating import GatingFusion
 from ..utils.hooks import HiddenStateHook, get_layers, get_hidden_size
 from ..utils.layer_mapping import proportional_mapping
@@ -50,6 +50,11 @@ class UniFusionModel(nn.Module):
         # 可训练参数
         self.adapter = None  # BidirectionalAdapter
         self.gating = None   # GatingFusion
+        # 变长/跨网格重采样器（Stage 1a，resampler_type != "none" 时启用）
+        # 输入侧负责把大模型内容注入小模型，输出侧负责把小模型内容读回大模型网格
+        self.resampler_in = None
+        self.resampler_out = None
+        self.resampler_in_gate = None
         
         # Hook
         self._large_hook = None
@@ -119,11 +124,51 @@ class UniFusionModel(nn.Module):
             temperature=self.gating_config.temperature,
         )
         
+        # 变长/跨网格重采样器（Stage 1a）：允许大小模型 token 网格不一致
+        # （不同 tokenizer、不同序列长度，乃至跨模态）。两个方向各一个交叉注意力，
+        # query 取「目标侧自己的表示」（决定输出网格），kv 取「源侧隐状态」（提供内容）。
+        self.resampler_in = None
+        self.resampler_out = None
+        self.resampler_in_gate = None
+        if getattr(self.adapter_config, "resampler_type", "none") != "none":
+            # 输入侧：query=小模型 start 层输入（小模型网格），kv=大模型 hook 层隐状态。
+            # 这里刻意不做零初始化：「初始恒等」由零初始化的门控标量保证；若 o_proj 与
+            # 门控同时为 0，grad_gate=<grad_z, injected>=0 且 grad_o_proj=gate*(...)=0，
+            # 梯度会双重归零而永久死锁。
+            self.resampler_in = CrossAttentionResampler(
+                query_dim=small_dim,
+                kv_dim=large_dim,
+                num_heads=self.adapter_config.resampler_heads,
+                dropout=self.adapter_config.dropout,
+                zero_init=False,
+            )
+            # 输出侧：query=大模型 hook 层输出（大模型网格），kv=小模型输出隐状态。
+            # 输出侧没有独立门控，改由 o_proj 零初始化来保证「初始 corr == 0」。
+            # 注意由此形成的「分阶段自解锁」链条（已实测验证）：
+            #   step0: corr==0 且 tanh(gate)==0，故 grad_gate=<grad_fused, corr>=0；
+            #          但 grad_resampler_out ≠ 0（其乘子是 gating 的 init_gate≠0）；
+            #   step1: o_proj 更新后 corr≠0 -> grad_gate≠0 -> 门控脱离 0；
+            #   step2: 门控非零后 resampler_in 才开始拿到梯度。
+            # 因此该链条依赖 gating.init_gate ≠ 0（默认 0.5）；若把它也置 0 会重新死锁。
+            self.resampler_out = CrossAttentionResampler(
+                query_dim=large_dim,
+                kv_dim=small_dim,
+                num_heads=self.adapter_config.resampler_heads,
+                dropout=self.adapter_config.dropout,
+                zero_init=True,
+            )
+            # 输入侧注入强度的标量门控：零初始化 -> tanh(0)=0 -> 初始注入恒为 0
+            self.resampler_in_gate = nn.Parameter(torch.zeros(1))
+        
         # 适配层/门控保持 fp32（bf16 参数会让 AdamW 的更新量被数值精度直接吞掉），
         # 但必须放到大模型所在设备上，前向时再做 dtype 转换。
         large_device = next(self.large_model.parameters()).device
         self.adapter.to(device=large_device)
         self.gating.to(device=large_device)
+        if self.resampler_in is not None:
+            self.resampler_in.to(device=large_device)
+            self.resampler_out.to(device=large_device)
+            self.resampler_in_gate.data = self.resampler_in_gate.data.to(large_device)
         
         print(f"[UniFusion] 模型初始化完成")
         print(f"  大模型: {self._large_num_layers}层, dim={large_dim}")
@@ -136,6 +181,8 @@ class UniFusionModel(nn.Module):
     def _enhance_with_small_model(self, hidden_native: torch.Tensor,
                                   input_ids: torch.Tensor,
                                   attention_mask: Optional[torch.Tensor],
+                                  small_input_ids: Optional[torch.Tensor] = None,
+                                  small_attention_mask: Optional[torch.Tensor] = None,
                                   past_key_values=None,
                                   cache_position: Optional[torch.Tensor] = None,
                                   use_cache: bool = False):
@@ -147,10 +194,22 @@ class UniFusionModel(nn.Module):
         transformers 版本不兼容），而是用小模型的 forward_pre_hook 把第 start 层
         的输入替换为适配层输出，mask / RoPE / causal 全部交给原生 forward 处理。
 
+        Stage 1a（resampler_type="cross_attn"）：允许大小模型 token 网格不一致
+        （不同 tokenizer / 不同序列长度，乃至跨模态）。此时小模型用自己的
+        small_input_ids 前向，两侧各用一个交叉注意力重采样：
+            输入侧 z_in     = z_native + tanh(gate) * Resampler_in(query=z_native, kv=h_large)
+            输出侧 enhanced = h_large  + Resampler_out(query=h_large_native, kv=h_small_out)
+        z_native 是小模型第 start 层的原生输入（本来就会被算出来、此前被丢弃），
+        因此不增加额外前向。初始恒等由「零初始化门控 + 输出侧零初始化 o_proj」保证：
+        `z_in == z_native`、`enhanced == h_large`，融合结果严格退化为主干原生行为。
+
         Args:
             hidden_native: 大模型 hook 层输出 [batch, n_new, large_dim]
-            input_ids: 本次前向的输入 token（要求大小模型同 tokenizer）
-            attention_mask: 注意力 mask（增量解码时为完整序列的 mask）
+            input_ids: 大模型的输入 token
+            attention_mask: 大模型的注意力 mask
+            small_input_ids: 小模型自己的输入 token（不同 tokenizer 时必填；
+                None 表示复用 input_ids，即同 tokenizer 场景）
+            small_attention_mask: 小模型的注意力 mask，None 表示复用 attention_mask
             past_key_values: 小模型自己的 KV cache（增量解码用）
             cache_position: 本次前向 token 在整条序列中的位置（增量解码用）
             use_cache: 是否维护 KV cache
@@ -162,15 +221,33 @@ class UniFusionModel(nn.Module):
         small_device = next(self.small_model.parameters()).device
         small_dtype = next(self.small_model.parameters()).dtype
 
-        projected_input = self.adapter.forward_large_to_small(
-            hidden_native.float()
-        ).to(device=small_device, dtype=small_dtype)
+        use_resampler = self.resampler_in is not None
+        small_ids = input_ids if small_input_ids is None else small_input_ids
+        small_mask = attention_mask if small_attention_mask is None else small_attention_mask
+
+        projected_input = None
+        resampler_kv_mask = None
+        if not use_resampler:
+            projected_input = self.adapter.forward_large_to_small(
+                hidden_native.float()
+            ).to(device=small_device, dtype=small_dtype)
+        elif attention_mask is not None and attention_mask.shape[1] == hidden_native.shape[1]:
+            # kv_mask 必须与 hidden_native 的位置一一对应；增量解码下 attention_mask
+            # 是整条序列而 hidden_native 只有新 token，长度对不上时保守地不传 mask
+            resampler_kv_mask = attention_mask.to(hidden_native.device)
 
         captured: Dict[str, Any] = {}
 
         def _inject_pre_hook(module, args):
             # 替换 start 层的输入隐状态；前缀层的输出会被丢弃
-            return (projected_input,) + tuple(args[1:])
+            if not use_resampler:
+                return (projected_input,) + tuple(args[1:])
+            z_native = args[0]
+            injected = self.resampler_in(
+                z_native.float(), hidden_native.float(), kv_mask=resampler_kv_mask
+            ).to(dtype=z_native.dtype)
+            gate = torch.tanh(self.resampler_in_gate).to(dtype=z_native.dtype)
+            return (z_native + gate * injected,) + tuple(args[1:])
 
         def _capture_output_hook(module, args, output):
             captured["hidden"] = output[0] if isinstance(output, tuple) else output
@@ -185,8 +262,8 @@ class UniFusionModel(nn.Module):
         small_backbone = getattr(self.small_model, "model", self.small_model)
         try:
             small_outputs = small_backbone(
-                input_ids=input_ids.to(small_device),
-                attention_mask=None if attention_mask is None else attention_mask.to(small_device),
+                input_ids=small_ids.to(small_device),
+                attention_mask=None if small_mask is None else small_mask.to(small_device),
                 use_cache=use_cache,
                 past_key_values=past_key_values,
                 cache_position=None if cache_position is None else cache_position.to(small_device),
@@ -196,7 +273,21 @@ class UniFusionModel(nn.Module):
             out_handle.remove()
 
         hidden_small_output = captured["hidden"].to(hidden_native.device)
-        enhanced = self.adapter.forward_small_to_large(hidden_small_output.float())
+        if not use_resampler:
+            enhanced = self.adapter.forward_small_to_large(hidden_small_output.float())
+        else:
+            # 输出侧重采样：把小模型输出（小模型网格）读回到大模型网格上。
+            # o_proj 零初始化 -> 初始 corr 恒为 0 -> enhanced == hidden_native，
+            # 于是门控融合在初始时严格退化为大模型原生输出（无预热崩溃）。
+            out_kv_mask = small_mask
+            if out_kv_mask is not None and out_kv_mask.shape[1] != hidden_small_output.shape[1]:
+                out_kv_mask = None
+            corr = self.resampler_out(
+                hidden_native.float(),
+                hidden_small_output.float(),
+                kv_mask=None if out_kv_mask is None else out_kv_mask.to(hidden_native.device),
+            )
+            enhanced = hidden_native.float() + corr
         return enhanced, getattr(small_outputs, "past_key_values", None)
     
     def forward_native(self, input_ids: torch.Tensor, 
@@ -215,6 +306,8 @@ class UniFusionModel(nn.Module):
                      attention_mask: torch.Tensor,
                      labels: Optional[torch.Tensor] = None,
                      return_details: bool = False,
+                     small_input_ids: Optional[torch.Tensor] = None,
+                     small_attention_mask: Optional[torch.Tensor] = None,
                      past_key_values=None,
                      small_past_key_values=None,
                      use_cache: bool = False,
@@ -239,6 +332,9 @@ class UniFusionModel(nn.Module):
         cache 通过 outputs.small_past_key_values 透出，供调用方在下一步回填。
 
         Args:
+            small_input_ids: 小模型自己的输入 token（Stage 1a 跨 tokenizer 时必填；
+                None 表示复用 input_ids，即同 tokenizer 场景）
+            small_attention_mask: 小模型的注意力 mask，None 表示复用 attention_mask
             past_key_values: 大模型的 KV cache（增量解码时传入）
             small_past_key_values: 小模型的 KV cache（增量解码时传入）
             use_cache: 是否维护 KV cache（训练时置 False）
@@ -255,6 +351,8 @@ class UniFusionModel(nn.Module):
 
             hidden_enhanced, small_new_cache = self._enhance_with_small_model(
                 hidden_native, input_ids, attention_mask,
+                small_input_ids=small_input_ids,
+                small_attention_mask=small_attention_mask,
                 past_key_values=small_past_key_values,
                 cache_position=cache_position,
                 use_cache=use_cache,
@@ -342,6 +440,14 @@ class UniFusionModel(nn.Module):
                 **kwargs,
             )
 
+        # 跨 tokenizer 时逐 token 增量生成不成立（新 token 属于大模型词表，无法直接
+        # 追加到小模型序列）。Stage 1a 只覆盖整段前向 / 校准，这里显式报错而非静默出错。
+        if self.resampler_in is not None and self._uses_distinct_tokenizer():
+            raise NotImplementedError(
+                "大小模型 tokenizer 不同，逐 token 增量生成尚未支持（Stage 1a 仅覆盖"
+                "整段前向与校准）。请使用同 tokenizer，或改用 forward_call 做整段前向。"
+            )
+
         generated = input_ids.clone()
         gen_attention_mask = attention_mask.clone()
         device = input_ids.device
@@ -405,14 +511,25 @@ class UniFusionModel(nn.Module):
         if self.large_tokenizer is None:
             return None
         return self.large_tokenizer.pad_token_id or self.large_tokenizer.eos_token_id
+
+    def _uses_distinct_tokenizer(self) -> bool:
+        """大小模型 tokenizer 是否使用不同词表（用于判断能否逐 token 增量生成）"""
+        if self.large_tokenizer is None or self.small_tokenizer is None:
+            return False
+        return (getattr(self.large_tokenizer, "vocab_size", None)
+                != getattr(self.small_tokenizer, "vocab_size", None))
     
     def get_trainable_parameters(self):
-        """获取可训练参数（只有适配层和门控）"""
+        """获取可训练参数（适配层、门控和重采样器）"""
         params = []
         if self.adapter is not None:
             params.extend(self.adapter.parameters())
         if self.gating is not None:
             params.extend(self.gating.parameters())
+        if self.resampler_in is not None:
+            params.extend(self.resampler_in.parameters())
+            params.extend(self.resampler_out.parameters())
+            params.append(self.resampler_in_gate)
         return params
     
     def count_trainable_parameters(self) -> int:
@@ -420,23 +537,37 @@ class UniFusionModel(nn.Module):
         return sum(p.numel() for p in self.get_trainable_parameters() if p.requires_grad)
     
     def save_adapter(self, path: str):
-        """保存适配层和门控的权重"""
+        """保存适配层、门控和重采样器的权重"""
         torch.save({
             "adapter": self.adapter.state_dict() if self.adapter else None,
             "gating": self.gating.state_dict() if self.gating else None,
+            "resampler_in": self.resampler_in.state_dict() if self.resampler_in else None,
+            "resampler_out": self.resampler_out.state_dict() if self.resampler_out else None,
+            "resampler_in_gate": (
+                None if self.resampler_in_gate is None
+                else self.resampler_in_gate.detach().cpu()
+            ),
             "config": {
                 "large_hook_layer": self.model_config.large_hook_layer,
                 "small_start_layer": self._small_start_layer_idx,
                 "small_output_layer": self.model_config.small_output_layer,
+                "resampler_type": getattr(self.adapter_config, "resampler_type", "none"),
             }
         }, path)
         print(f"[UniFusion] 适配层已保存到 {path}")
     
     def load_adapter(self, path: str):
-        """加载适配层和门控的权重"""
+        """加载适配层、门控和重采样器的权重"""
         checkpoint = torch.load(path, map_location="cpu")
-        if self.adapter and checkpoint["adapter"]:
+        if self.adapter and checkpoint.get("adapter"):
             self.adapter.load_state_dict(checkpoint["adapter"])
-        if self.gating and checkpoint["gating"]:
+        if self.gating and checkpoint.get("gating"):
             self.gating.load_state_dict(checkpoint["gating"])
+        if self.resampler_in is not None:
+            if checkpoint.get("resampler_in"):
+                self.resampler_in.load_state_dict(checkpoint["resampler_in"])
+                self.resampler_out.load_state_dict(checkpoint["resampler_out"])
+            gate = checkpoint.get("resampler_in_gate")
+            if gate is not None:
+                self.resampler_in_gate.data.copy_(gate.to(self.resampler_in_gate.device))
         print(f"[UniFusion] 适配层已从 {path} 加载")

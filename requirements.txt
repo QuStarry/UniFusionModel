@@ -12,3 +12,6 @@ protobuf>=3.20.0
 # human-eval
 # 可选：用于vLLM加速推理
 # vllm>=0.3.0
+
+# 测试（tests/ 下的用例均为 CPU 秒级微型模型，无需 GPU）
+pytest>=7.0.0

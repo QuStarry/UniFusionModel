@@ -25,11 +25,17 @@ from ..utils.hooks import HiddenStateHook, get_layers
 
 
 class CalibrationDataset(Dataset):
-    """校准数据集：专业领域的无标注文本"""
+    """校准数据集：专业领域的无标注文本
+
+    跨 tokenizer（Stage 1a）时同时用小模型 tokenizer 编码同一段文本，
+    让 P_in/重采样器对小模型自己的 token 网格生效。
+    """
     
-    def __init__(self, data_path: str, tokenizer, max_length: int = 1024):
+    def __init__(self, data_path: str, tokenizer, max_length: int = 1024,
+                 small_tokenizer=None):
         self.samples = []
         self.tokenizer = tokenizer
+        self.small_tokenizer = small_tokenizer
         self.max_length = max_length
         
         with open(data_path, 'r') as f:
@@ -40,14 +46,16 @@ class CalibrationDataset(Dataset):
                     if text:
                         self.samples.append(text)
         
-        print(f"[CalibrationDataset] 加载了 {len(self.samples)} 条校准样本")
+        desc = f"{len(self.samples)} 条校准样本"
+        if small_tokenizer is not None:
+            desc += "（已启用小模型独立 tokenizer）"
+        print(f"[CalibrationDataset] 加载了 {desc}")
     
     def __len__(self):
         return len(self.samples)
     
-    def __getitem__(self, idx):
-        text = self.samples[idx]
-        encoding = self.tokenizer(
+    def _encode(self, tokenizer, text: str) -> Dict[str, torch.Tensor]:
+        encoding = tokenizer(
             text,
             max_length=self.max_length,
             truncation=True,
@@ -58,6 +66,15 @@ class CalibrationDataset(Dataset):
             "input_ids": encoding["input_ids"].squeeze(0),
             "attention_mask": encoding["attention_mask"].squeeze(0),
         }
+    
+    def __getitem__(self, idx):
+        text = self.samples[idx]
+        item = self._encode(self.tokenizer, text)
+        if self.small_tokenizer is not None:
+            small = self._encode(self.small_tokenizer, text)
+            item["small_input_ids"] = small["input_ids"]
+            item["small_attention_mask"] = small["attention_mask"]
+        return item
 
 
 class AdapterCalibrator:
@@ -97,6 +114,9 @@ class AdapterCalibrator:
         """
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
+        # Stage 1a：跨 tokenizer 时小模型拥有自己的 token 网格
+        small_input_ids = batch.get("small_input_ids", input_ids)
+        small_attention_mask = batch.get("small_attention_mask", attention_mask)
         
         losses = {}
         
@@ -111,42 +131,56 @@ class AdapterCalibrator:
             h_large_hook = large_hook.output.detach()
             large_hook.remove()
             
-            # 小模型完整前向，提取start层和output层隐状态
+            # 小模型完整前向，提取start层和output层隐状态（用其自己的 token 网格）
             small_layers = get_layers(self.model.small_model)
             small_start_hook = HiddenStateHook(small_layers[self.model._small_start_layer_idx])
             small_output_hook = HiddenStateHook(small_layers[self.model._small_output_layer_idx])
             small_start_hook.register()
             small_output_hook.register()
             
-            small_input_ids = input_ids.to(self.model.small_model.device)
-            small_attention_mask = attention_mask.to(self.model.small_model.device)
-            self.model.small_model(input_ids=small_input_ids, attention_mask=small_attention_mask)
+            self.model.small_model(
+                input_ids=small_input_ids.to(self.model.small_model.device),
+                attention_mask=small_attention_mask.to(self.model.small_model.device),
+            )
             
             h_small_start = small_start_hook.output.detach().to(input_ids.device)
             h_small_output = small_output_hook.output.detach().to(input_ids.device)
             small_start_hook.remove()
             small_output_hook.remove()
         
-        # P_in对齐：P_in(h_large_hook) 应该接近 h_small_start
-        # 主干模型是 bf16、适配层是 fp32，进适配层前必须先转 fp32
-        h_large_f = h_large_hook.float()
-        h_large_projected = self.model.adapter.forward_large_to_small(h_large_f)
-        loss_p_in = F.mse_loss(h_large_projected, h_small_start.float())
-        
-        # P_out对齐(1)：分布约束——P_out(h_small_output) 的均值/方差应接近大模型hook层隐状态
-        h_small_projected = self.model.adapter.forward_small_to_large(h_small_output.float())
-        loss_p_out = F.mse_loss(
-            h_small_projected.mean(dim=(0, 1)), h_large_f.mean(dim=(0, 1))
-        ) + F.mse_loss(
-            h_small_projected.std(dim=(0, 1)), h_large_f.std(dim=(0, 1))
+        # P_in/P_out 的逐位置对齐要求大小模型 token 网格逐位对应。跨 tokenizer 时
+        # 同一段文本被切成不同的 token 序列，即使 padding 到同一长度，位置语义也对
+        # 不上（形状守卫会被 padding 掩盖），因此这里按「词表是否一致」判断而非仅看
+        # 形状；跨网格时跳过该约束（重采样器改由端到端 lm_loss 驱动训练）。
+        grid_aligned = (
+            (self.model.resampler_in is None or not self.model._uses_distinct_tokenizer())
+            and h_large_hook.shape[1] == h_small_start.shape[1]
         )
-        
-        losses["hidden_mse"] = self.train_config.hidden_mse_weight * (loss_p_in + loss_p_out)
-        
-        # P_out对齐(2)：循环一致性——P_out(P_in(h_large)) 应能还原 h_large。
-        # 分布约束只是序列级统计量，这里补一条逐位置的强约束（P_in/P_out 互为逆映射）。
-        h_cycle = self.model.adapter.forward_small_to_large(h_large_projected)
-        losses["cycle"] = self.train_config.cycle_weight * F.mse_loss(h_cycle, h_large_f)
+        if grid_aligned:
+            # 主干模型是 bf16、适配层是 fp32，进适配层前必须先转 fp32
+            h_large_f = h_large_hook.float()
+            h_large_projected = self.model.adapter.forward_large_to_small(h_large_f)
+            loss_p_in = F.mse_loss(h_large_projected, h_small_start.float())
+            
+            # P_out对齐(1)：分布约束——P_out(h_small_output)的均值/方差应接近大模型hook层隐状态
+            h_small_projected = self.model.adapter.forward_small_to_large(h_small_output.float())
+            loss_p_out = F.mse_loss(
+                h_small_projected.mean(dim=(0, 1)), h_large_f.mean(dim=(0, 1))
+            ) + F.mse_loss(
+                h_small_projected.std(dim=(0, 1)), h_large_f.std(dim=(0, 1))
+            )
+            
+            losses["hidden_mse"] = self.train_config.hidden_mse_weight * (loss_p_in + loss_p_out)
+            
+            # P_out对齐(2)：循环一致性——P_out(P_in(h_large)) 应能还原 h_large。
+            # 分布约束只是序列级统计量，这里补一条逐位置的强约束（P_in/P_out 互为逆映射）。
+            h_cycle = self.model.adapter.forward_small_to_large(h_large_projected)
+            losses["cycle"] = self.train_config.cycle_weight * F.mse_loss(h_cycle, h_large_f)
+        else:
+            # 跨网格下这两项不适用，置零保持 key 稳定（便于日志聚合）
+            zero = torch.zeros((), device=input_ids.device)
+            losses["hidden_mse"] = zero
+            losses["cycle"] = zero
         
         # ===== 损失2: 端到端LM loss（融合后的模型应该能流畅生成专业文本）=====
         # 用input_ids作为labels（自回归）
@@ -157,6 +191,8 @@ class AdapterCalibrator:
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,
+            small_input_ids=small_input_ids,
+            small_attention_mask=small_attention_mask,
         )
         losses["lm_loss"] = self.train_config.lm_weight * outputs_call.loss
         
@@ -304,10 +340,16 @@ def run_calibration(config: UniFusionConfig):
     
     # 准备数据
     print("\n[4/4] 准备校准数据...")
+    # Stage 1a：启用重采样时用小模型自己的 tokenizer 编码，跨 tokenizer 才有意义
+    use_small_tokenizer = (
+        getattr(config.adapter, "resampler_type", "none") != "none"
+        and small_tokenizer is not large_tokenizer
+    )
     dataset = CalibrationDataset(
         config.train.train_data_path,
         large_tokenizer,
         max_length=1024,
+        small_tokenizer=small_tokenizer if use_small_tokenizer else None,
     )
     dataloader = DataLoader(
         dataset,
