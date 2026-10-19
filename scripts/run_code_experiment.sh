@@ -12,10 +12,15 @@ echo "=========================================="
 
 # 配置
 export CUDA_VISIBLE_DEVICES=0,1
-LARGE_MODEL="Qwen/Qwen2-7B-Instruct"
-SMALL_MODEL="deepseek-ai/deepseek-coder-6.7b-instruct"
-WORK_DIR=$(dirname "$0")
-cd "$WORK_DIR"
+# 同族同 tokenizer：保证大模型 input_ids 可以直接喂给小模型
+LARGE_MODEL="Qwen/Qwen2.5-7B-Instruct"
+SMALL_MODEL="Qwen/Qwen2.5-Coder-7B-Instruct"
+
+# 切到项目根目录（脚本可能在 scripts/ 下被调用）
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_ROOT"
+# UniFusionModel 包需要其父目录在 PYTHONPATH 上
+export PYTHONPATH="$(dirname "$PROJECT_ROOT"):$PYTHONPATH"
 
 # Step 1: 准备校准数据
 echo ""
@@ -28,6 +33,8 @@ echo "[Step 2/3] 适配层校准训练..."
 python main.py calibrate \
     --large_model "$LARGE_MODEL" \
     --small_model "$SMALL_MODEL" \
+    --large_device cuda:0 \
+    --small_device cuda:1 \
     --train_data data/calibration_code.jsonl \
     --output_dir checkpoints/code_adapter \
     --max_steps 500
@@ -38,6 +45,8 @@ echo "[Step 3/3] 评测对比（native vs call）..."
 python main.py evaluate \
     --large_model "$LARGE_MODEL" \
     --small_model "$SMALL_MODEL" \
+    --large_device cuda:0 \
+    --small_device cuda:1 \
     --adapter checkpoints/code_adapter/adapter_final.pt \
     --tasks humaneval,gsm8k,mmlu \
     --modes native,call \

@@ -6,7 +6,9 @@ UniFusion 主入口
     python main.py prepare --domain code --num_samples 200
     
     # 2. 校准训练
-    python main.py calibrate --config configs/code_experiment.yaml
+    python main.py calibrate --large_model Qwen/Qwen2.5-7B-Instruct \
+        --small_model Qwen/Qwen2.5-Coder-7B-Instruct \
+        --train_data data/calibration_code.jsonl --max_steps 500
     
     # 3. 评测
     python main.py evaluate --adapter checkpoints/adapter_final.pt --modes native call
@@ -15,13 +17,13 @@ import argparse
 import sys
 import os
 
-# 添加项目根目录到path
+# 把项目根目录的父目录加入path，使 UniFusionModel 包（即本目录）可被导入
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from unifusion.config import get_default_config
-from unifusion.trainers import run_calibration
-from unifusion.eval import run_evaluation
-from unifusion.data.prepare_data import (
+from UniFusionModel.config import get_default_config
+from UniFusionModel.trainers import run_calibration
+from UniFusionModel.eval import run_evaluation
+from UniFusionModel.data.prepare_data import (
     generate_code_calibration_data,
     generate_math_calibration_data,
     generate_medical_calibration_data,
@@ -62,6 +64,10 @@ def cmd_calibrate(args):
         config.train.output_dir = args.output_dir
     if args.max_steps:
         config.train.max_steps = args.max_steps
+    if args.large_device:
+        config.model.large_model_device = args.large_device
+    if args.small_device:
+        config.model.small_model_device = args.small_device
     
     run_calibration(config)
 
@@ -80,6 +86,10 @@ def cmd_evaluate(args):
         config.eval.num_samples = args.num_samples
     if args.output_path:
         config.eval.output_path = args.output_path
+    if args.large_device:
+        config.model.large_model_device = args.large_device
+    if args.small_device:
+        config.model.small_model_device = args.small_device
     
     modes = args.modes.split(",") if args.modes else ["native", "call"]
     
@@ -104,6 +114,8 @@ def main():
     p_calibrate.add_argument("--train_data", type=str, default=None)
     p_calibrate.add_argument("--output_dir", type=str, default=None)
     p_calibrate.add_argument("--max_steps", type=int, default=None)
+    p_calibrate.add_argument("--large_device", type=str, default=None, help="大模型设备，如 cuda:0")
+    p_calibrate.add_argument("--small_device", type=str, default=None, help="小模型设备，如 cuda:1")
     
     # evaluate
     p_eval = subparsers.add_parser("evaluate", help="评测")
@@ -116,6 +128,8 @@ def main():
                        help="逗号分隔的模式列表")
     p_eval.add_argument("--num_samples", type=int, default=None)
     p_eval.add_argument("--output_path", type=str, default=None)
+    p_eval.add_argument("--large_device", type=str, default=None, help="大模型设备，如 cuda:0")
+    p_eval.add_argument("--small_device", type=str, default=None, help="小模型设备，如 cuda:1")
     
     args = parser.parse_args()
     

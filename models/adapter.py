@@ -60,8 +60,10 @@ class AdapterLayer(nn.Module):
         else:
             raise ValueError(f"未知的适配层类型: {adapter_type}")
         
+        # LayerNorm 作用在「分支输入」上（维度是 input_dim），刻意不挂在残差恒等路径上：
+        # 若放在 forward 末尾对输出做归一化，proj_out 零初始化时的恒等映射就会被破坏。
         if use_layer_norm:
-            self.ln = nn.LayerNorm(output_dim)
+            self.ln = nn.LayerNorm(input_dim)
         else:
             self.ln = nn.Identity()
     
@@ -96,20 +98,22 @@ class AdapterLayer(nn.Module):
             [batch, seq_len, output_dim]
         """
         if self.adapter_type == "linear":
-            out = self.proj(x)
+            out = self.proj(self.ln(x))
         
         elif self.adapter_type == "mlp":
-            hidden = self.act(self.proj_in(x))
+            hidden = self.act(self.proj_in(self.ln(x)))
             hidden = self.drop(hidden)
             out = self.proj_out(hidden)
         
         elif self.adapter_type == "mlp_residual":
+            # 残差恒等路径只走 residual_proj，不被 LayerNorm 触碰；
+            # 初始时 proj_out 为零，所以 out == residual_proj(x)（恒等初始化成立）
             residual = self.residual_proj(x)
-            hidden = self.act(self.proj_in(x))
+            hidden = self.act(self.proj_in(self.ln(x)))
             hidden = self.drop(hidden)
-            out = residual + self.proj_out(hidden)  # 初始时proj_out为零，所以out≈residual
+            out = residual + self.proj_out(hidden)
         
-        return self.ln(out)
+        return out
 
 
 class BidirectionalAdapter(nn.Module):

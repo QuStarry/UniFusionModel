@@ -219,3 +219,9 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .memory_cache/
+
+# UniFusion 运行产物（保留 data/prepare_data.py 等源码）
+/checkpoints/
+/logs/
+/data/*.jsonl
+*.pt

@@ -8,16 +8,21 @@ from typing import Optional, List
 
 @dataclass
 class ModelConfig:
-    """模型配置"""
+    """模型配置
+
+    注意：大模型与小模型必须使用同一个 tokenizer（同族模型）。因为小模型是直接
+    复用大模型的 input_ids 做前向的，tokenizer 不一致时序列长度和切分都对不上，
+    适配层 P_in 的逐位置对齐就失去意义。
+    """
     # 大模型（通用基座）
-    large_model_name: str = "Qwen/Qwen2-7B-Instruct"
+    large_model_name: str = "Qwen/Qwen2.5-7B-Instruct"
     large_model_dtype: str = "bfloat16"
     large_model_device: str = "cuda:0"
     # 在大模型的第几层提取/注入隐状态（支持负数，-1表示最后一层）
     large_hook_layer: int = -8  # 倒数第8层，通常是高级语义形成层
 
-    # 专业小模型
-    small_model_name: str = "deepseek-ai/deepseek-coder-6.7b-instruct"
+    # 专业小模型（与大模型同族，共用 Qwen2 tokenizer）
+    small_model_name: str = "Qwen/Qwen2.5-Coder-7B-Instruct"
     small_model_dtype: str = "bfloat16"
     small_model_device: str = "cuda:1"
     # 小模型从第几层开始继续前向传播（前面的层被大模型替代）
@@ -38,8 +43,8 @@ class AdapterConfig:
     adapter_type: str = "mlp_residual"
     # Dropout
     dropout: float = 0.1
-    # 是否使用层归一化
-    use_layer_norm: bool = True
+    # 是否使用层归一化（作用于分支输入，默认关闭以保证「初始即恒等映射」）
+    use_layer_norm: bool = False
     # 初始化方式：xavier / identity / zero
     init_method: str = "identity"
 
@@ -71,11 +76,13 @@ class TrainConfig:
     gradient_accumulation_steps: int = 2
 
     # 损失函数权重
-    # 隐状态MSE损失权重
+    # 隐状态MSE损失权重（P_in 逐位置对齐 + P_out 分布对齐）
     hidden_mse_weight: float = 1.0
-    # 输出KL散度损失权重（让融合后的输出分布接近小模型）
-    output_kl_weight: float = 0.5
-    # 大模型原生输出保持损失（防止门控完全偏向小模型）
+    # 循环一致性损失权重（P_out(P_in(h)) ≈ h，对 P_out 的逐位置强约束）
+    cycle_weight: float = 1.0
+    # 端到端LM loss权重
+    lm_weight: float = 1.0
+    # 大模型原生输出保持损失权重（KL(原生‖融合)，标准KD方向，防止门控完全偏向小模型）
     native_keep_weight: float = 0.1
 
     # 保存

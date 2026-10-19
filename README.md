@@ -27,8 +27,12 @@ UniFusion的方案：大模型在中间层提取隐状态 → 通过轻量适配
 
 ## 目录结构
 
+> 注意：`main.py` 以「包」的方式导入本目录（`from UniFusionModel.config import ...`），
+> 所以**仓库目录名必须保持 `UniFusionModel`**，并且运行时需要其父目录在 `PYTHONPATH` 上
+> （`main.py` 会自动加，用脚本运行时脚本也会自动加）。
+
 ```
-unifusion/
+UniFusionModel/
 ├── config/              # 配置系统
 │   ├── default_config.py
 │   └── __init__.py
@@ -82,11 +86,15 @@ bash scripts/run_code_experiment.sh
 ```
 
 默认配置：
-- 大模型：Qwen2-7B-Instruct（GPU 0）
-- 小模型：DeepSeek-Coder-6.7B-Instruct（GPU 1）
+- 大模型：Qwen2.5-7B-Instruct（GPU 0）
+- 小模型：Qwen2.5-Coder-7B-Instruct（GPU 1）
 - 校准数据：200条代码样本
 - 训练步数：500步
 - 评测：HumanEval + GSM8K + MMLU，对比 native vs call 模式
+
+> **为什么大小模型必须同族？** 小模型是直接复用大模型的 `input_ids` 做前向的，
+> 两者必须共用同一个 tokenizer。因此默认组合是 Qwen2.5（通用）+ Qwen2.5-Coder（代码），
+> 二者 tokenizer 完全一致。换模型时请一并核对 tokenizer 是否相同。
 
 ### 4. 自定义运行
 
@@ -96,16 +104,20 @@ python main.py prepare --domain code --num_samples 200
 
 # 校准训练
 python main.py calibrate \
-    --large_model Qwen/Qwen2-7B-Instruct \
-    --small_model deepseek-ai/deepseek-coder-6.7b-instruct \
+    --large_model Qwen/Qwen2.5-7B-Instruct \
+    --small_model Qwen/Qwen2.5-Coder-7B-Instruct \
+    --large_device cuda:0 \
+    --small_device cuda:1 \
     --train_data data/calibration_code.jsonl \
     --output_dir checkpoints/my_experiment \
     --max_steps 500
 
 # 评测
 python main.py evaluate \
-    --large_model Qwen/Qwen2-7B-Instruct \
-    --small_model deepseek-ai/deepseek-coder-6.7b-instruct \
+    --large_model Qwen/Qwen2.5-7B-Instruct \
+    --small_model Qwen/Qwen2.5-Coder-7B-Instruct \
+    --large_device cuda:0 \
+    --small_device cuda:1 \
     --adapter checkpoints/my_experiment/adapter_final.pt \
     --tasks humaneval,gsm8k,mmlu \
     --modes native,call \

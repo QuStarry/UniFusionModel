@@ -3,8 +3,10 @@
 
 训练目标（自监督，不需要任务标注）：
 1. P_in校准：大模型hook层隐状态 → 投影 → 逼近小模型同层的真实隐状态
-2. P_out校准：小模型输出层隐状态 → 投影 → 逼近大模型后续层期望的输入分布
+2. P_out校准：循环一致性 P_out(P_in(h_large)) ≈ h_large（逐位置强约束），
+   外加小模型输出投影后的均值/方差分布对齐
 3. 端到端校准：融合后的模型在专业文本上的LM loss尽可能低
+4. 原生保持：融合后logits与原生日志的KL正则（标准KD方向），防遗忘
 
 校准数据：专业领域的无标注文本（如代码、医学文献），50-200条即可
 """
@@ -87,10 +89,11 @@ class AdapterCalibrator:
         """
         计算校准损失
         
-        包含三个部分：
-        1. hidden_mse: P_in和P_out的隐状态对齐损失
-        2. output_kl: 融合后输出分布与小模型输出分布的KL散度
-        3. native_keep: 保持大模型原生输出能力的正则化
+        包含四个部分：
+        1. hidden_mse: P_in逐位置对齐 + P_out的均值/方差分布对齐
+        2. cycle: 循环一致性 P_out(P_in(h_large)) ≈ h_large（逐位置强约束）
+        3. lm_loss: 融合后模型的端到端语言建模损失
+        4. native_keep: 保持大模型原生输出能力的KL正则
         """
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
@@ -125,21 +128,25 @@ class AdapterCalibrator:
             small_output_hook.remove()
         
         # P_in对齐：P_in(h_large_hook) 应该接近 h_small_start
-        h_large_projected = self.model.adapter.forward_large_to_small(h_large_hook)
-        loss_p_in = F.mse_loss(h_large_projected, h_small_start)
+        # 主干模型是 bf16、适配层是 fp32，进适配层前必须先转 fp32
+        h_large_f = h_large_hook.float()
+        h_large_projected = self.model.adapter.forward_large_to_small(h_large_f)
+        loss_p_in = F.mse_loss(h_large_projected, h_small_start.float())
         
-        # P_out对齐：P_out(h_small_output) 应该在大模型的隐空间中合理
-        # 这里用大模型hook层输出的统计量（均值、方差）作为弱监督
-        h_small_projected = self.model.adapter.forward_small_to_large(h_small_output)
+        # P_out对齐(1)：分布约束——P_out(h_small_output) 的均值/方差应接近大模型hook层隐状态
+        h_small_projected = self.model.adapter.forward_small_to_large(h_small_output.float())
         loss_p_out = F.mse_loss(
-            h_small_projected.mean(dim=(0, 1)),
-            h_large_hook.mean(dim=(0, 1))
+            h_small_projected.mean(dim=(0, 1)), h_large_f.mean(dim=(0, 1))
         ) + F.mse_loss(
-            h_small_projected.std(dim=(0, 1)),
-            h_large_hook.std(dim=(0, 1))
+            h_small_projected.std(dim=(0, 1)), h_large_f.std(dim=(0, 1))
         )
         
         losses["hidden_mse"] = self.train_config.hidden_mse_weight * (loss_p_in + loss_p_out)
+        
+        # P_out对齐(2)：循环一致性——P_out(P_in(h_large)) 应能还原 h_large。
+        # 分布约束只是序列级统计量，这里补一条逐位置的强约束（P_in/P_out 互为逆映射）。
+        h_cycle = self.model.adapter.forward_small_to_large(h_large_projected)
+        losses["cycle"] = self.train_config.cycle_weight * F.mse_loss(h_cycle, h_large_f)
         
         # ===== 损失2: 端到端LM loss（融合后的模型应该能流畅生成专业文本）=====
         # 用input_ids作为labels（自回归）
@@ -151,7 +158,7 @@ class AdapterCalibrator:
             attention_mask=attention_mask,
             labels=labels,
         )
-        losses["lm_loss"] = outputs_call.loss
+        losses["lm_loss"] = self.train_config.lm_weight * outputs_call.loss
         
         # ===== 损失3: 原生输出保持（防止门控完全偏向小模型）=====
         with torch.no_grad():
@@ -161,10 +168,12 @@ class AdapterCalibrator:
             )
             native_logits = outputs_native.logits
         
-        # 融合后的logits不应与原生logits相差太远（在非专业token上）
+        # 融合后的logits不应与原生logits相差太远（防遗忘）。
+        # 方向为 KL(p_native ‖ q_fused)，即标准知识蒸馏的 teacher→student 方向。
         loss_kl = F.kl_div(
             F.log_softmax(outputs_call.logits, dim=-1),
-            F.softmax(native_logits, dim=-1),
+            F.log_softmax(native_logits, dim=-1),
+            log_target=True,
             reduction="batchmean",
         )
         losses["native_keep"] = self.train_config.native_keep_weight * loss_kl
@@ -192,9 +201,6 @@ class AdapterCalibrator:
                 batch = next(data_iter)
             
             batch = {k: v.to(self.model.large_model.device) for k, v in batch.items()}
-            
-            # 梯度累积
-            self.train_config.gradient_accumulation_steps
             
             # 前向
             losses = self._compute_calibration_loss(batch)
@@ -228,6 +234,7 @@ class AdapterCalibrator:
                     "loss": f"{avg_losses['total']:.4f}",
                     "lm": f"{avg_losses.get('lm_loss', 0):.4f}",
                     "mse": f"{avg_losses.get('hidden_mse', 0):.4f}",
+                    "cyc": f"{avg_losses.get('cycle', 0):.4f}",
                     "gate": f"{gate_val:.3f}",
                     "lr": f"{self.scheduler.get_last_lr()[0]:.2e}",
                 })

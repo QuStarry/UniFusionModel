@@ -242,6 +242,9 @@ class Evaluator:
             all_results[mode] = mode_results
         
         # 保存汇总结果
+        output_dir = os.path.dirname(self.config.eval.output_path)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         with open(self.config.eval.output_path, 'w') as f:
             json.dump(all_results, f, indent=2, ensure_ascii=False)
         

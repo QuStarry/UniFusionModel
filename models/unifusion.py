@@ -119,6 +119,12 @@ class UniFusionModel(nn.Module):
             temperature=self.gating_config.temperature,
         )
         
+        # 适配层/门控保持 fp32（bf16 参数会让 AdamW 的更新量被数值精度直接吞掉），
+        # 但必须放到大模型所在设备上，前向时再做 dtype 转换。
+        large_device = next(self.large_model.parameters()).device
+        self.adapter.to(device=large_device)
+        self.gating.to(device=large_device)
+        
         print(f"[UniFusion] 模型初始化完成")
         print(f"  大模型: {self._large_num_layers}层, dim={large_dim}")
         print(f"  小模型: {self._small_num_layers}层, dim={small_dim}")
@@ -127,61 +133,71 @@ class UniFusionModel(nn.Module):
         print(f"  小模型输出层: {self._small_output_layer_idx}")
         print(f"  适配层参数量: {self.adapter.count_parameters():,}")
     
-    def _prepare_small_model_forward(self, input_ids: torch.Tensor, 
-                                      attention_mask: torch.Tensor,
-                                      device: torch.device):
+    def _enhance_with_small_model(self, hidden_native: torch.Tensor,
+                                  input_ids: torch.Tensor,
+                                  attention_mask: Optional[torch.Tensor],
+                                  past_key_values=None,
+                                  cache_position: Optional[torch.Tensor] = None,
+                                  use_cache: bool = False):
         """
-        为小模型的中间层前向传播准备attention_mask和position_ids
-        
-        对于decoder-only模型，需要构造causal attention mask
-        """
-        batch_size, seq_len = input_ids.shape
-        
-        # position_ids
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        
-        # attention mask: 转换为4D的causal mask [batch, 1, seq, seq]
-        # 这里简化处理，大部分模型的层会自己处理mask
-        # 我们传入原始的attention_mask，让层自己处理
-        return position_ids, attention_mask
-    
-    def _run_small_model_from_layer(self, hidden_states: torch.Tensor,
-                                     start_layer: int, end_layer: int,
-                                     attention_mask: torch.Tensor,
-                                     position_ids: torch.Tensor) -> torch.Tensor:
-        """
-        让小模型从指定层开始前向传播到指定层
-        
+        把大模型 hook 层的隐状态投影进小模型，让小模型从中间层继续前向，
+        再把小模型的输出投影回大模型空间。
+
+        实现要点：不再手写逐层循环（那样要自己拼 causal mask 和 RoPE，容易和
+        transformers 版本不兼容），而是用小模型的 forward_pre_hook 把第 start 层
+        的输入替换为适配层输出，mask / RoPE / causal 全部交给原生 forward 处理。
+
         Args:
-            hidden_states: 输入隐状态 [batch, seq, small_dim]
-            start_layer: 起始层索引
-            end_layer: 结束层索引（包含）
-            attention_mask: 注意力mask
-            position_ids: 位置id
-        
+            hidden_native: 大模型 hook 层输出 [batch, n_new, large_dim]
+            input_ids: 本次前向的输入 token（要求大小模型同 tokenizer）
+            attention_mask: 注意力 mask（增量解码时为完整序列的 mask）
+            past_key_values: 小模型自己的 KV cache（增量解码用）
+            cache_position: 本次前向 token 在整条序列中的位置（增量解码用）
+            use_cache: 是否维护 KV cache
+
         Returns:
-            最终隐状态 [batch, seq, small_dim]
+            (增强后的隐状态 [batch, n_new, large_dim] fp32, 小模型新的 past_key_values)
         """
         small_layers = get_layers(self.small_model)
-        
-        # 某些模型需要past_key_value，这里设为None（不使用KV cache）
-        past_key_value = None
-        
-        for layer_idx in range(start_layer, end_layer + 1):
-            layer = small_layers[layer_idx]
-            
-            # 不同模型的层forward签名略有不同，这里用通用方式调用
-            layer_outputs = layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                use_cache=False,
+        small_device = next(self.small_model.parameters()).device
+        small_dtype = next(self.small_model.parameters()).dtype
+
+        projected_input = self.adapter.forward_large_to_small(
+            hidden_native.float()
+        ).to(device=small_device, dtype=small_dtype)
+
+        captured: Dict[str, Any] = {}
+
+        def _inject_pre_hook(module, args):
+            # 替换 start 层的输入隐状态；前缀层的输出会被丢弃
+            return (projected_input,) + tuple(args[1:])
+
+        def _capture_output_hook(module, args, output):
+            captured["hidden"] = output[0] if isinstance(output, tuple) else output
+
+        pre_handle = small_layers[self._small_start_layer_idx].register_forward_pre_hook(
+            _inject_pre_hook
+        )
+        out_handle = small_layers[self._small_output_layer_idx].register_forward_hook(
+            _capture_output_hook
+        )
+        # 只跑 backbone（跳过 lm_head）：这里只要隐状态，不需要 [batch, seq, vocab] 的 logits
+        small_backbone = getattr(self.small_model, "model", self.small_model)
+        try:
+            small_outputs = small_backbone(
+                input_ids=input_ids.to(small_device),
+                attention_mask=None if attention_mask is None else attention_mask.to(small_device),
+                use_cache=use_cache,
+                past_key_values=past_key_values,
+                cache_position=None if cache_position is None else cache_position.to(small_device),
             )
-            
-            hidden_states = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
-        
-        return hidden_states
+        finally:
+            pre_handle.remove()
+            out_handle.remove()
+
+        hidden_small_output = captured["hidden"].to(hidden_native.device)
+        enhanced = self.adapter.forward_small_to_large(hidden_small_output.float())
+        return enhanced, getattr(small_outputs, "past_key_values", None)
     
     def forward_native(self, input_ids: torch.Tensor, 
                        attention_mask: torch.Tensor,
@@ -199,131 +215,90 @@ class UniFusionModel(nn.Module):
                      attention_mask: torch.Tensor,
                      labels: Optional[torch.Tensor] = None,
                      return_details: bool = False,
+                     past_key_values=None,
+                     small_past_key_values=None,
+                     use_cache: bool = False,
+                     cache_position: Optional[torch.Tensor] = None,
                      **kwargs) -> CausalLMOutputWithPast:
         """
         调用模式前向传播（核心方法）
-        
+
         流程：
-        1. 大模型前向到hook层，提取隐状态
-        2. 适配层P_in投影到小模型空间
-        3. 小模型从对应层继续前向
-        4. 适配层P_out投影回大模型空间
-        5. 门控融合
-        6. 注入回大模型，继续后续层
+        1. 大模型原生前向；在 hook 层注册 forward_hook，拿到该层的原生隐状态
+        2. 小模型从对应层继续前向（内含 P_in 投影），输出再经 P_out 投影回大模型空间
+        3. 门控融合原生隐状态与增强隐状态
+        4. 用融合结果替换 hook 层的输出，大模型继续后续层直到 lm_head / loss
+
+        实现要点：不再手写逐层前向（那需要自行构造 4D causal mask 与 RoPE 的
+        position_embeddings，和 transformers 版本强耦合），而是用原生 forward +
+        forward_hook 替换该层输出，mask / RoPE / cache 全部交给 transformers 处理。
+
+        增量解码（P1-11）：use_cache=True 时，大/小模型各自维护 KV cache。
+        hook 层替换的是「层输出」而非「层输入」，因此每一层缓存的 K/V 都来自
+        未受融合影响的输入，逐 token 复用与整段前向在数学上等价。小模型的
+        cache 通过 outputs.small_past_key_values 透出，供调用方在下一步回填。
+
+        Args:
+            past_key_values: 大模型的 KV cache（增量解码时传入）
+            small_past_key_values: 小模型的 KV cache（增量解码时传入）
+            use_cache: 是否维护 KV cache（训练时置 False）
+            cache_position: 本次前向 token 在整条序列中的绝对位置（增量解码时必须给）
         """
         large_layers = get_layers(self.large_model)
-        device = input_ids.device
-        
-        # ===== Step 1: 大模型前向到hook层 =====
-        # 手动运行大模型的前几层
-        inputs_embeds = self.large_model.model.embed_tokens(input_ids)
-        hidden_large = inputs_embeds
-        
-        # 构造大模型的position_ids和attention_mask
-        batch_size, seq_len = input_ids.shape
-        large_position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        
-        # 运行大模型前hook层（0到hook_layer-1）
-        for layer_idx in range(self._large_hook_layer_idx):
-            layer = large_layers[layer_idx]
-            layer_outputs = layer(
-                hidden_large,
-                attention_mask=attention_mask,
-                position_ids=large_position_ids,
-                use_cache=False,
-            )
-            hidden_large = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
-        
-        # 保存hook层的原生输出（用于融合）
-        # 运行hook层本身
         hook_layer = large_layers[self._large_hook_layer_idx]
-        hook_outputs = hook_layer(
-            hidden_large,
-            attention_mask=attention_mask,
-            position_ids=large_position_ids,
-            use_cache=False,
-        )
-        hidden_native = hook_outputs[0] if isinstance(hook_outputs, tuple) else hook_outputs
-        
-        # ===== Step 2: 适配层P_in投影到小模型空间 =====
-        hidden_small_input = self.adapter.forward_large_to_small(hidden_native)
-        
-        # ===== Step 3: 小模型从对应层继续前向 =====
-        # 构造小模型的position_ids和attention_mask
-        small_position_ids, small_attention_mask = self._prepare_small_model_forward(
-            input_ids, attention_mask, device
-        )
-        
-        # 小模型需要在自己的device上
-        hidden_small_input = hidden_small_input.to(self.small_model.device)
-        small_attention_mask = small_attention_mask.to(self.small_model.device)
-        small_position_ids = small_position_ids.to(self.small_model.device)
-        
-        # 运行小模型从start_layer到output_layer
-        hidden_small_output = self._run_small_model_from_layer(
-            hidden_small_input,
-            start_layer=self._small_start_layer_idx,
-            end_layer=self._small_output_layer_idx,
-            attention_mask=small_attention_mask,
-            position_ids=small_position_ids,
-        )
-        
-        # 移回大模型device
-        hidden_small_output = hidden_small_output.to(device)
-        
-        # ===== Step 4: 适配层P_out投影回大模型空间 =====
-        hidden_enhanced = self.adapter.forward_small_to_large(hidden_small_output)
-        
-        # ===== Step 5: 门控融合 =====
-        if return_details:
+
+        details: Dict[str, torch.Tensor] = {}
+        small_cache: Dict[str, Any] = {}
+
+        def _fuse_hook(module, args, output):
+            hidden_native = output[0] if isinstance(output, tuple) else output
+
+            hidden_enhanced, small_new_cache = self._enhance_with_small_model(
+                hidden_native, input_ids, attention_mask,
+                past_key_values=small_past_key_values,
+                cache_position=cache_position,
+                use_cache=use_cache,
+            )
+            small_cache["past_key_values"] = small_new_cache
+
+            # 门控参数是 fp32，这里统一到 fp32 融合，再转回主干 dtype 以兼容后续层
             hidden_fused, gate_value = self.gating(
-                hidden_native, hidden_enhanced, return_gate=True
+                hidden_native.float(), hidden_enhanced, return_gate=True
             )
-        else:
-            hidden_fused = self.gating(hidden_native, hidden_enhanced)
-            gate_value = None
-        
-        # ===== Step 6: 大模型继续后续层 =====
-        hidden_large = hidden_fused
-        for layer_idx in range(self._large_hook_layer_idx + 1, self._large_num_layers):
-            layer = large_layers[layer_idx]
-            layer_outputs = layer(
-                hidden_large,
+            hidden_fused = hidden_fused.to(hidden_native.dtype)
+
+            if return_details:
+                details["hidden_native"] = hidden_native
+                details["hidden_enhanced"] = hidden_enhanced
+                details["gate_value"] = gate_value
+
+            if isinstance(output, tuple):
+                return (hidden_fused,) + tuple(output[1:])
+            return hidden_fused
+
+        handle = hook_layer.register_forward_hook(_fuse_hook)
+        try:
+            outputs = self.large_model(
+                input_ids=input_ids,
                 attention_mask=attention_mask,
-                position_ids=large_position_ids,
-                use_cache=False,
+                labels=labels,
+                use_cache=use_cache,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                **kwargs,
             )
-            hidden_large = layer_outputs[0] if isinstance(layer_outputs, tuple) else layer_outputs
-        
-        # 最终的norm和lm_head
-        hidden_large = self.large_model.model.norm(hidden_large)
-        logits = self.large_model.lm_head(hidden_large)
-        
-        # 计算loss
-        loss = None
-        if labels is not None:
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
-        
-        output = CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=None,
-            hidden_states=None,
-            attentions=None,
-        )
-        
+        finally:
+            handle.remove()
+
+        if use_cache:
+            outputs.small_past_key_values = small_cache.get("past_key_values")
+
         if return_details:
-            output.gate_value = gate_value
-            output.hidden_native = hidden_native
-            output.hidden_enhanced = hidden_enhanced
-        
-        return output
+            outputs.gate_value = details.get("gate_value")
+            outputs.hidden_native = details.get("hidden_native")
+            outputs.hidden_enhanced = details.get("hidden_enhanced")
+
+        return outputs
     
     def forward(self, input_ids: torch.Tensor,
                 attention_mask: torch.Tensor,
@@ -350,22 +325,47 @@ class UniFusionModel(nn.Module):
                  **kwargs) -> torch.Tensor:
         """
         生成方法（用于评测）
-        
-        注意：当前实现是逐token生成，效率较低但逻辑清晰。
-        验证阶段够用，后续可以优化为KV cache版本。
+
+        native 模式直接复用大模型自带的 generate（内部已做 KV cache）。
+        call 模式走增量解码（P1-11）：预填充整段 prompt，之后每次只前向 1 个
+        token，大模型与小模型各自维护 KV cache，避免每步重复计算整段序列。
         """
+        if mode == "native":
+            return self.large_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=temperature > 0,
+                temperature=temperature if temperature > 0 else None,
+                top_p=top_p if temperature > 0 else None,
+                pad_token_id=self._get_pad_token_id(),
+                **kwargs,
+            )
+
         generated = input_ids.clone()
         gen_attention_mask = attention_mask.clone()
-        
+        device = input_ids.device
+
+        # 增量解码状态：首步预填充整段 prompt，后续每次只喂 1 个新 token
+        cur_input_ids = generated
+        cur_cache_position = torch.arange(generated.shape[1], device=device)
+        large_past = None
+        small_past = None
+
         for _ in range(max_new_tokens):
-            # 前向传播
-            outputs = self.forward(
-                input_ids=generated,
+            outputs = self.forward_call(
+                input_ids=cur_input_ids,
                 attention_mask=gen_attention_mask,
-                mode=mode,
+                use_cache=True,
+                past_key_values=large_past,
+                small_past_key_values=small_past,
+                cache_position=cur_cache_position,
             )
+            large_past = outputs.past_key_values
+            small_past = getattr(outputs, "small_past_key_values", None)
+
             next_token_logits = outputs.logits[:, -1, :]
-            
+
             # 采样
             if temperature > 0:
                 next_token_logits = next_token_logits / temperature
@@ -380,21 +380,31 @@ class UniFusionModel(nn.Module):
                 next_token = torch.multinomial(F.softmax(next_token_logits, dim=-1), num_samples=1)
             else:
                 next_token = next_token_logits.argmax(dim=-1, keepdim=True)
-            
+
             # 拼接
             generated = torch.cat([generated, next_token], dim=-1)
             gen_attention_mask = torch.cat([
-                gen_attention_mask, 
+                gen_attention_mask,
                 torch.ones((gen_attention_mask.shape[0], 1), device=gen_attention_mask.device)
             ], dim=-1)
-            
+
+            # 下一步只前向新 token，其绝对位置是当前序列长度 - 1
+            cur_input_ids = next_token
+            cur_cache_position = torch.tensor([generated.shape[1] - 1], device=device)
+
             # 检查EOS
             if self.large_tokenizer is not None:
                 eos_token_id = self.large_tokenizer.eos_token_id
                 if eos_token_id is not None and (next_token == eos_token_id).all():
                     break
-        
+
         return generated
+
+    def _get_pad_token_id(self) -> Optional[int]:
+        """取 pad_token_id，缺省时回退到 eos（Qwen2 二者常相同）"""
+        if self.large_tokenizer is None:
+            return None
+        return self.large_tokenizer.pad_token_id or self.large_tokenizer.eos_token_id
     
     def get_trainable_parameters(self):
         """获取可训练参数（只有适配层和门控）"""
